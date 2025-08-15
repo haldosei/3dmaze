@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>3D迷路</title>
+<style>
+  body { margin:0; background:#111; color:#fff; font-family:system-ui, sans-serif; text-align:center; }
+  header { padding:8px; }
+  canvas { display:block; margin:auto; background:#222; }
+  .hint { opacity:0.85; font-size:14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>3D迷路</h1>
+  <div class="hint">← → 回転 / ↑ ↓ 移動 / Shift ダッシュ / R リスタート</div>
+</header>
+<canvas id="game" width="800" height="480"></canvas>
+
+<script>
+window.addEventListener('load', () => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // 1=壁, 0=床, "G"=ゴール（右下隅近く）
+  const map = [
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,0,0,0,1,0,0,0,0,1,0,1,0,0,0,0,0,0,0,1],
+    [1,0,1,0,1,0,1,1,0,1,0,1,0,1,1,1,1,1,0,1],
+    [1,0,1,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1,0,1],
+    [1,0,1,0,1,1,1,1,1,1,0,1,1,1,1,1,0,1,0,1],
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,1],
+    [1,1,1,0,1,1,1,1,0,1,1,1,1,0,1,1,0,1,0,1],
+    [1,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,1],
+    [1,0,1,0,1,1,1,1,1,1,0,1,1,1,0,1,1,1,0,1],
+    [1,0,1,0,0,0,0,0,0,1,0,0,0,1,0,0,0,1,0,1],
+    [1,0,1,1,1,1,0,1,0,1,1,1,0,1,1,1,0,1,0,1],
+    [1,0,0,0,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,"G"],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+  ];
+  const MAP_W = map[0].length, MAP_H = map.length;
+
+  const player = { x: 1.5, y: 1.5, a: 0 };
+  const enemies = []; // {x,y}
+  let state = 'play'; // 'play' | 'win' | 'lose'
+
+  // レンダリング・入力設定
+  const FOV = Math.PI / 3;
+  const NUM_RAYS = 200;
+  const MAX_DEPTH = 24;
+  const STEP = 0.02;
+  const keys = {};
+  let depthBuffer = new Array(NUM_RAYS).fill(MAX_DEPTH);
+
+  window.addEventListener('keydown', (e) => {
+    keys[e.key] = true;
+    if (e.key.startsWith('Arrow')) e.preventDefault();
+    if (e.key === 'r' || e.key === 'R') resetGame();
+  });
+  window.addEventListener('keyup', (e) => { keys[e.key] = false; });
+
+  function isWall(ix, iy) {
+    if (iy < 0 || iy >= MAP_H || ix < 0 || ix >= MAP_W) return 1;
+    return map[iy][ix] === 1 ? 1 : 0;
+  }
+  function isGoal(ix, iy) {
+    if (iy < 0 || iy >= MAP_H || ix < 0 || ix >= MAP_W) return false;
+    return map[iy][ix] === "G";
+  }
+
+  // 敵をランダム床マスに3体スポーン（プレイヤー/ゴールから距離を置く）
+  function randomEnemySpawn(count) {
+    enemies.length = 0;
+    while (enemies.length < count) {
+      const ex = Math.floor(Math.random() * MAP_W);
+      const ey = Math.floor(Math.random() * MAP_H);
+      if (!isWall(ex, ey) && !isGoal(ex, ey)) {
+        const farFromPlayer = Math.hypot(player.x - ex, player.y - ey) > 6;
+        // ゴール位置探索
+        let gx = 0, gy = 0;
+        for (let y = 0; y < MAP_H; y++) {
+          for (let x = 0; x < MAP_W; x++) {
+            if (isGoal(x, y)) { gx = x + 0.5; gy = y + 0.5; }
+          }
+        }
+        const farFromGoal = Math.hypot(gx - (ex + 0.5), gy - (ey + 0.5)) > 4;
+        if (farFromPlayer && farFromGoal) {
+          enemies.push({ x: ex + 0.5, y: ey + 0.5 });
+        }
+      }
+    }
+  }
+
+  function resetGame() {
+    player.x = 1.5; player.y = 1.5; player.a = 0;
+    state = 'play';
+    randomEnemySpawn(3);
+  }
+
+  function castRays(px, py, pa) {
+    const rays = [];
+    depthBuffer = new Array(NUM_RAYS).fill(MAX_DEPTH);
+    for (let i = 0; i < NUM_RAYS; i++) {
+      const rayAngle = pa - FOV / 2 + (FOV * i) / (NUM_RAYS - 1);
+      let dist = 0, hit = false, hitGoal = false;
+      while (!hit && dist < MAX_DEPTH) {
+        dist += STEP;
+        const sx = px + Math.cos(rayAngle) * dist;
+        const sy = py + Math.sin(rayAngle) * dist;
+        const ix = Math.floor(sx), iy = Math.floor(sy);
+        if (isGoal(ix, iy)) { hit = true; hitGoal = true; break; }
+        if (isWall(ix, iy) === 1) { hit = true; break; }
+      }
+      const corrected = dist * Math.cos(rayAngle - pa);
+      depthBuffer[i] = corrected;
+      rays.push({ angle: rayAngle, distance: dist, corrected, hitGoal });
+    }
+    return rays;
+  }
+
+  function render3D(rays) {
+    const W = canvas.width, H = canvas.height;
+
+    // 空・床（単色で視認性重視）
+    ctx.fillStyle = '#87CEFA'; ctx.fillRect(0, 0, W, H / 2);
+    ctx.fillStyle = '#444444'; ctx.fillRect(0, H / 2, W, H / 2);
+
+    // 壁（グレー単色 + 距離減衰、ゴールに当たった縦スライスは黄色）
+    const colW = W / NUM_RAYS;
+    for (let i = 0; i < rays.length; i++) {
+      const dist = Math.max(0.0001, rays[i].corrected);
+      const wallH = Math.max(1, Math.min(H, H / dist));
+      const shade = Math.max(60, 240 - dist * 60) | 0;
+      ctx.fillStyle = rays[i].hitGoal ? '#fff280' : `rgb(${shade},${shade},${shade})`;
+      ctx.fillRect(i * colW, (H - wallH) / 2, Math.ceil(colW) + 1, wallH);
+    }
+
+    // 敵スプライト（👾）: 壁の手前にある場合のみ描画
+    enemies.forEach(e => drawSprite(e.x, e.y, "👾"));
+  }
+
+  function drawSprite(sx, sy, emoji) {
+    const dx = sx - player.x;
+    const dy = sy - player.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 0.0001) return;
+
+    let ang = Math.atan2(dy, dx) - player.a;
+    while (ang < -Math.PI) ang += 2 * Math.PI;
+    while (ang >  Math.PI) ang -= 2 * Math.PI;
+    if (Math.abs(ang) > FOV / 1.1) return; // 視界外
+
+    const W = canvas.width, H = canvas.height;
+    const size = Math.max(12, 260 / dist); // 近いほど大
+    const screenX = W / 2 + (ang * (W / FOV)) - size / 2;
+    const screenY = H / 2 - size * 0.75; // ちょい床寄り
+
+    // 奥行きテスト（中央列で簡易Zバッファ）
+    const colW = W / NUM_RAYS;
+    const centerCol = Math.max(0, Math.min(NUM_RAYS - 1, Math.floor((screenX + size / 2) / colW)));
+    if (dist > depthBuffer[centerCol] + 0.02) return;
+
+    ctx.font = `${size}px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(emoji, screenX + size / 2, screenY + size / 2);
+  }
+
+  function renderMiniMap() {
+    const scale = 10, pad = 6, ox = pad, oy = pad;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(ox - 3, oy - 3, MAP_W * scale + 6, MAP_H * scale + 6);
+
+    for (let y = 0; y < MAP_H; y++) {
+      for (let x = 0; x < MAP_W; x++) {
+        if (map[y][x] === 1) ctx.fillStyle = '#9a9a9a';
+        else if (map[y][x] === "G") ctx.fillStyle = '#ffeb3b';
+        else ctx.fillStyle = '#1f1f1f';
+        ctx.fillRect(ox + x * scale, oy + y * scale, scale - 1, scale - 1);
+      }
+    }
+    // Player
+    const px = ox + player.x * scale, py = oy + player.y * scale;
+    ctx.fillStyle = '#00e5ff';
+    ctx.beginPath(); ctx.arc(px, py, 2, 0, Math.PI * 2); ctx.fill();
+    // 向き線
+    ctx.strokeStyle = '#00e5ff';
+    ctx.beginPath(); ctx.moveTo(px, py);
+    ctx.lineTo(px + Math.cos(player.a) * 8, py + Math.sin(player.a) * 8);
+    ctx.stroke();
+    // Enemies
+    ctx.fillStyle = '#ff5252';
+    enemies.forEach(e => {
+      ctx.beginPath();
+      ctx.arc(ox + e.x * scale, oy + e.y * scale, 2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  function update(dt) {
+    if (state !== 'play') return;
+
+    const rotSpeed = (keys.Shift ? 2.3 : 1.7) * dt;
+    const moveSpeed = (keys.Shift ? 3.6 : 2.3) * dt;
+
+    if (keys['ArrowLeft'])  player.a -= rotSpeed;
+    if (keys['ArrowRight']) player.a += rotSpeed;
+
+    let dx = 0, dy = 0;
+    if (keys['ArrowUp'])   { dx += Math.cos(player.a) * moveSpeed; dy += Math.sin(player.a) * moveSpeed; }
+    if (keys['ArrowDown']) { dx -= Math.cos(player.a) * moveSpeed; dy -= Math.sin(player.a) * moveSpeed; }
+
+    const nx = player.x + dx, ny = player.y + dy;
+    if (!isWall(Math.floor(nx), Math.floor(player.y))) player.x = nx;
+    if (!isWall(Math.floor(player.x), Math.floor(ny))) player.y = ny;
+
+    // 勝利判定
+    if (isGoal(Math.floor(player.x), Math.floor(player.y))) {
+      state = 'win';
+      return;
+    }
+
+    // 敵AI: 各敵がプレイヤーへじわっと接近（X/Y別に衝突判定）
+    const enemySpeed = 1.4 * dt;
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      const ex = player.x - e.x, ey = player.y - e.y;
+      const d = Math.hypot(ex, ey);
+      if (d > 0.05) {
+        const vx = (ex / d) * enemySpeed;
+        const vy = (ey / d) * enemySpeed;
+        const enx = e.x + vx, eny = e.y + vy;
+        if (!isWall(Math.floor(enx), Math.floor(e.y))) e.x = enx;
+        if (!isWall(Math.floor(e.x), Math.floor(eny))) e.y = eny;
+      }
+      // 接触で敗北
+      if (Math.hypot(player.x - e.x, player.y - e.y) < 0.35) {
+        state = 'lose';
+        return;
+      }
+    }
+  }
+
+  function drawOverlay() {
+    const W = canvas.width, H = canvas.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 36px system-ui, sans-serif';
+    if (state === 'win')  ctx.fillText('🎉 CLEAR!', W / 2, H / 2 - 10);
+    if (state === 'lose') ctx.fillText('💥 GAME OVER', W / 2, H / 2 - 10);
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText('R キーでリスタート', W / 2, H / 2 + 26);
+  }
+
+  let last = performance.now();
+  function frame(t) {
+    const dt = Math.min(0.05, (t - last) / 1000);
+    last = t;
+
+    update(dt);
+    const rays = castRays(player.x, player.y, player.a);
+    render3D(rays);
+    renderMiniMap();
+    if (state !== 'play') drawOverlay();
+
+    requestAnimationFrame(frame);
+  }
+
+  resetGame();
+  requestAnimationFrame(frame);
+});
+</script>
+</body>
+</html>
